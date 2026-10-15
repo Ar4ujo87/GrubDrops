@@ -224,6 +224,15 @@ type Watcher struct {
 	// freezeThreshold the watcher rotates to another channel/campaign.
 	noAdvanceTicks int
 
+	// freezeStreak counts consecutive freeze rotations that did not get the
+	// current benefit moving; freezeLimit() doubles the flat-poll threshold
+	// per streak step. freezeStallMin is the minute value we rotated at: the
+	// streak only resets once an inventory poll reports MORE than that (the
+	// per-watch lastProgressMin resets to 0 on every rotation, so it cannot
+	// be used for this). Both reset when a different benefit starts.
+	freezeStreak   int
+	freezeStallMin int
+
 	// stalledChannels maps a channel slug -> the time until which it is
 	// on freeze cooldown. Populated when a watch on that channel is
 	// detected frozen (noAdvanceTicks >= freezeThreshold); pickStream
@@ -848,6 +857,41 @@ const synthSkipThreshold = 6
 // server-side stall promptly. (The prod incident sat frozen for hours and
 // only a container restart recovered it — this is the detector for that.)
 const freezeThreshold = 5
+
+// freezeThresholdMax caps the escalating freeze threshold (see freezeLimit).
+// 40 polls is ~40 minutes at the locked 60s cadence.
+const freezeThresholdMax = 40
+
+// freezeLimit returns how many consecutive flat inventory polls are needed
+// before the watcher rotates off the current channel, given how many
+// rotations in a row already failed to get the same benefit moving.
+//
+// A flat counter is usually Twitch crediting minutes late and in lumps (the
+// counter sat still for 1-2h across 13+ different channels in a real log and
+// then jumped), not a bad channel. Rotating every 5 minutes just tears down
+// and restarts the watch session over and over without ever helping, so each
+// unrecovered rotation doubles the wait: 5, 10, 20, 40 polls, then stays at
+// freezeThresholdMax. The streak resets as soon as minutes advance past the
+// value we stalled at (or the benefit changes), so a genuine one-off stall
+// still rotates after the original 5 polls.
+func freezeLimit(streak int) int {
+	limit := freezeThreshold
+	for i := 0; i < streak && limit < freezeThresholdMax; i++ {
+		limit *= 2
+	}
+	if limit > freezeThresholdMax {
+		limit = freezeThresholdMax
+	}
+	return limit
+}
+
+// realBenefitSkipThreshold is the ghost-skip grace, in inventory polls, for a
+// benefit with a REAL Twitch UUID. Twitch can take several minutes to enroll a
+// campaign in dropCampaignsInProgress after the first beacon (4.0 min was
+// observed in a real log, barely under synthSkipThreshold's ~6), and a wrong
+// skip is persisted, so real benefits get twice the grace. Synth scrape
+// entries (no real UUID) keep the short synthSkipThreshold.
+const realBenefitSkipThreshold = 12
 
 // stalledChannelCooldown is how long a channel that was detected frozen
 // stays out of pickStream's candidate set. Long enough that the watcher
@@ -1604,6 +1648,8 @@ func (w *Watcher) pickStream(ctx context.Context) error {
 	if w.currentBenefit == nil || w.currentBenefit.ID != w.milestoneBenefit {
 		w.lastNotifiedMilestone = -1
 		w.milestoneBenefit = ""
+		w.freezeStreak = 0 // different benefit: start the freeze backoff over
+		w.freezeStallMin = 0
 		if w.currentBenefit != nil {
 			w.milestoneBenefit = w.currentBenefit.ID
 		}
@@ -1745,6 +1791,14 @@ func (w *Watcher) tickWatch(ctx context.Context) error {
 				w.noAdvanceTicks++
 			}
 			noAdvance := w.noAdvanceTicks
+			// Real advance past the minute we last rotated at: the stall
+			// resolved, so the next one starts from the base threshold.
+			if p.MinutesWatched > w.freezeStallMin {
+				w.freezeStreak = 0
+				w.freezeStallMin = p.MinutesWatched
+			}
+			freezeStreak := w.freezeStreak
+			freezeAt := freezeLimit(freezeStreak)
 			w.lastProgressMin = p.MinutesWatched
 			w.noProgressTicks = 0
 			// Capture the per-account drop-instance ID at progress
@@ -1775,8 +1829,10 @@ func (w *Watcher) tickWatch(ctx context.Context) error {
 			// keeps mining on the new channel; pickStream's StartWatch
 			// path dereferences them, so clearing the benefit here would
 			// panic the next tick.
-			if noAdvance >= freezeThreshold {
+			if noAdvance >= freezeAt {
 				w.mu.Lock()
+				w.freezeStreak++
+				w.freezeStallMin = p.MinutesWatched
 				stalledChannel := ""
 				if w.currentStream != nil {
 					stalledChannel = w.currentStream.Channel
@@ -1789,7 +1845,9 @@ func (w *Watcher) tickWatch(ctx context.Context) error {
 					"benefit_name", benefit.Name,
 					"channel", handle.Channel,
 					"stalled_min", p.MinutesWatched,
-					"flat_polls", noAdvance)
+					"flat_polls", noAdvance,
+					"freeze_streak", freezeStreak+1,
+					"next_rotation_after_polls", freezeLimit(freezeStreak+1))
 				_ = w.cfg.Backend.StopWatch(ctx, handle)
 				w.unsubscribeCurrentChannel()
 				w.mu.Lock()
@@ -1868,7 +1926,11 @@ func (w *Watcher) tickWatch(ctx context.Context) error {
 		// advance to the next campaign. Skip either case after the grace
 		// window. (Real drops normally enroll within a poll or two, so a
 		// genuinely-mining drop resets noProgressTicks long before this.)
-		if n >= synthSkipThreshold && prevProgress == 0 {
+		skipAfter := synthSkipThreshold
+		if !isSynthBenefitID(benefit.ID) {
+			skipAfter = realBenefitSkipThreshold
+		}
+		if n >= skipAfter && prevProgress == 0 {
 			slog.Warn("watcher: benefit never appeared in inventory (claimed or ghost); skipping",
 				"kind", "state",
 				"account", w.cfg.AccountID,

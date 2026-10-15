@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1763,4 +1764,78 @@ func TestWatcher_GhostSkip_SelfHealsWhenBenefitReappears(t *testing.T) {
 	_, stillSkipped := w.skippedBenefits["healme"]
 	w.mu.Unlock()
 	assert.False(t, stillSkipped, "healme must be removed from skippedBenefits after self-heal")
+}
+
+// TestFreezeLimit_Escalates: each consecutive unrecovered freeze rotation
+// doubles the flat-poll threshold (5, 10, 20, 40) and then stays capped, so a
+// counter that Twitch credits late stops being torn down every 5 minutes.
+func TestFreezeLimit_Escalates(t *testing.T) {
+	cases := []struct{ streak, want int }{
+		{0, freezeThreshold},
+		{1, freezeThreshold * 2},
+		{2, freezeThreshold * 4},
+		{3, freezeThresholdMax},
+		{4, freezeThresholdMax},
+		{50, freezeThresholdMax},
+	}
+	for _, c := range cases {
+		assert.Equal(t, c.want, freezeLimit(c.streak), "streak=%d", c.streak)
+	}
+	assert.Equal(t, freezeThreshold, freezeLimit(-1), "negative streak must behave like 0")
+}
+
+// lateEnrollBackend serves one real-UUID benefit that Twitch only enrolls in
+// dropCampaignsInProgress after enrollAfter inventory calls — the slow first
+// credit seen in production (a real log showed up to ~4 min).
+type lateEnrollBackend struct {
+	*platformtest.MockBackend
+	calls       atomic.Int32
+	enrollAfter int32
+}
+
+func (b *lateEnrollBackend) ListActiveCampaigns(_ context.Context, _ platform.Session) ([]platform.Campaign, error) {
+	return []platform.Campaign{{
+		ID: "lcamp", Game: "LateGame", Name: "Late Camp", Status: "active", AccountLinked: true,
+		Benefits: []platform.DropBenefit{{ID: "late1", CampaignID: "lcamp", Name: "Late One", RequiredMinutes: 9999}},
+	}}, nil
+}
+
+func (b *lateEnrollBackend) InventoryProgress(_ context.Context, _ platform.Session) ([]platform.Progress, error) {
+	if b.calls.Add(1) <= b.enrollAfter {
+		return nil, nil
+	}
+	return []platform.Progress{{BenefitID: "late1", MinutesWatched: 1}}, nil
+}
+
+// TestWatcher_GhostSkip_RealBenefitGetsLongerGrace: a real-UUID benefit that
+// Twitch enrolls after more than synthSkipThreshold polls but before
+// realBenefitSkipThreshold must NOT be ghost-skipped (the old 6-poll cutoff
+// persisted a wrong skip and the watcher walked away from a drop that was
+// about to start counting).
+func TestWatcher_GhostSkip_RealBenefitGetsLongerGrace(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	rec := newRecordingSkipRecorder()
+	// 1 call from pickCampaign + 9 empty polls: past the old 6-poll cutoff,
+	// still under the 12-poll real-benefit grace.
+	backend := &lateEnrollBackend{MockBackend: platformtest.New(), enrollAfter: 10}
+	require.Greater(t, int(backend.enrollAfter)-1, synthSkipThreshold)
+	require.Less(t, int(backend.enrollAfter)-1, realBenefitSkipThreshold)
+
+	w := New(Config{
+		AccountID:         "acc-late",
+		Backend:           backend,
+		Session:           platform.Session{AccessToken: "tok"},
+		Notifier:          &recordingNotifier{},
+		TickInterval:      2 * time.Millisecond,
+		HeartbeatInterval: 2 * time.Millisecond,
+		SkipRecorder:      rec.recordSkip,
+	})
+	go func() { _ = w.Run(ctx) }()
+
+	require.Eventually(t, func() bool {
+		return w.Snapshot().MinutesWatched >= 1
+	}, 2*time.Second, 2*time.Millisecond, "watcher never saw the late-enrolled benefit progress")
+	assert.Empty(t, rec.skips("acc-late"), "late-enrolling real benefit was ghost-skipped")
 }

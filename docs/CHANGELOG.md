@@ -4,6 +4,17 @@ All notable changes to GrubDrops.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A drop whose minutes are credited late no longer makes the miner hop
+  channels every 5 minutes.** Twitch often leaves the minutes counter flat for
+  an hour or more and then jumps it, on any channel. Each rotation now waits
+  twice as long as the last one that did not help (5, 10, 20, then 40
+  minutes), and starts over once the minutes move again.
+- **Drops that Twitch is slow to enroll are no longer skipped as "ghost".**
+  Real Twitch drops now get about 12 minutes to show up in the inventory
+  instead of about 6 before they are skipped (and the skip remembered).
+
 ### Docs
 
 - Added a warning that GrubDrops is currently not working as expected.
